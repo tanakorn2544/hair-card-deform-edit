@@ -19,7 +19,16 @@ Turn the toggle on and G / R / S work in the space you actually see. Drag a
 vertex to the right, it goes right. The add-on inverts the modifier stack every
 frame so the result lands where you put it.
 
-Works with proportional editing and snapping.
+Works with proportional editing, snapping, multi-object edit mode, and
+Shrink/Fatten.
+
+### Alt+S on a tapered card
+
+Blender's Shrink/Fatten offsets the cage vertex along its normal, and the Curve
+modifier then rescales that offset by the control point radius. On a card whose
+curve tapers, the same drag produces between 0.51x and 1.0x of the thickness you
+asked for - thin spots where the taper is tightest. Here the offset is applied
+to the visible position along the visible normal, so 1.0x lands everywhere.
 
 ## Install
 
@@ -34,7 +43,9 @@ Sidebar (N) > Hair Deform tab > big ON/OFF toggle.
 While it is on:
 
 - `G` / `R` / `S` - move, rotate, scale in deformed space
+- `Alt+S` - shrink/fatten along the visible normal
 - `Shift+Alt+G` / `R` / `S` - same thing, always available even with the toggle off
+- `Shift+Alt+F` - shrink/fatten, always available
 - `X` / `Y` / `Z` - axis constraint, `Shift+X` etc for plane
 - `Ctrl` - toggle snapping mid-drag
 - Wheel / PageUp / PageDown - proportional falloff size
@@ -52,8 +63,13 @@ otherwise.
 
 - Pivot point setting is respected, including 3D cursor.
 - Proportional falloff is fixed when the drag starts, same as Blender.
+- Multi-object edit mode is supported: every mesh in the session gets its own
+  solve, and the selection moves as one rigid group like Blender's transform.
 - Snap targets are read off deformed geometry, so you snap onto what you see.
+  Snapping is a screen-space search with a pixel radius, matching Blender - it
+  takes the feature nearest the cursor rather than the nearest in 3D.
 - Snapping sets position, not rotation. Align Rotation to Target is ignored.
+- Undo during a heavy edit session can be unstable. Save before undoing.
 - If the curve folds over on itself the inverse has no unique answer. The header
   warns instead of writing garbage.
 

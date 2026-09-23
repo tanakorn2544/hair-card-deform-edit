@@ -205,7 +205,63 @@ _MODE_LABEL = {
     'TRANSLATE': "Move",
     'ROTATE': "Rotate",
     'RESIZE': "Scale",
+    'SHRINK_FATTEN': "Shrink/Fatten",
 }
+
+
+class _Island:
+    """Everything the solve needs for ONE object in multi-object edit mode.
+
+    Blender lets several meshes share an Edit Mode session and transforms the
+    selection across all of them at once. Each object has its own modifier
+    stack, its own matrix and its own deform inverse, so the state cannot be
+    kept in flat attributes on the operator - it has to be per object.
+    """
+
+    __slots__ = ("ob", "bm", "selected", "indices", "weights", "prop_origin",
+                 "orig", "proxy", "jac", "start_deformed", "warm")
+
+    def __init__(self, ob, bm, selected):
+        self.ob = ob
+        self.bm = bm
+        self.selected = selected
+        self.indices = list(selected)
+        self.weights = {}
+        self.prop_origin = {}
+        self.orig = {}
+        self.proxy = None
+        self.jac = None
+        self.start_deformed = {}
+        self.warm = None
+
+    def weight(self, i):
+        """Proportional influence for a vertex; 1.0 when the mode is off."""
+        if not self.weights:
+            return 1.0
+        return self.weights.get(i, 0.0)
+
+    def free(self):
+        if self.proxy is not None:
+            self.proxy.free()
+            self.proxy = None
+
+
+def _editable_objects(context):
+    """Every mesh sharing this Edit Mode session, active one first."""
+    obs = []
+    try:
+        obs = [o for o in context.objects_in_mode if o.type == 'MESH']
+    except Exception:
+        obs = []
+    if not obs:
+        ob = context.edit_object
+        if ob is not None and ob.type == 'MESH':
+            obs = [ob]
+    active = context.edit_object
+    if active in obs:
+        obs.remove(active)
+        obs.insert(0, active)
+    return obs
 
 
 def _snap_anchor_world(context, selected, deformed, active, pivot):
@@ -259,6 +315,38 @@ def _pivot_world(context, indices, start_deformed, active_index):
     return acc / len(indices)
 
 
+def _visible_normals(ob, indices):
+    """World-space normals of the DEFORMED result, per vertex index.
+
+    Blender's Alt+S offsets the cage vertex along its normal by a fixed amount;
+    the modifier then scales that offset, so on a card whose curve radius varies
+    the same drag produces between 0.51x and 1.0x of the requested thickness.
+    Offsetting along the visible normal instead keeps what is asked for and what
+    appears the same thing.
+    """
+    out = {}
+    try:
+        dg = bpy.context.evaluated_depsgraph_get()
+        evo = ob.evaluated_get(dg)
+        me = evo.to_mesh()
+    except Exception:
+        return out
+    try:
+        nmat = ob.matrix_world.to_3x3().inverted().transposed()
+        n_v = len(me.vertices)
+        for i in indices:
+            if 0 <= i < n_v:
+                nrm = (nmat @ me.vertices[i].normal.copy())
+                if nrm.length > 1e-12:
+                    out[i] = nrm.normalized()
+    finally:
+        try:
+            evo.to_mesh_clear()
+        except Exception:
+            pass
+    return out
+
+
 class HAIRDEFORM_OT_transform(bpy.types.Operator):
     """Move, rotate or scale so the deformed result follows the mouse.
 
@@ -276,6 +364,8 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             ('TRANSLATE', "Move", "Move in deform space"),
             ('ROTATE', "Rotate", "Rotate in deform space"),
             ('RESIZE', "Scale", "Scale in deform space"),
+            ('SHRINK_FATTEN', "Shrink/Fatten",
+             "Move along the visible surface normal, in deform space"),
         ),
         default='TRANSLATE',
         options={'SKIP_SAVE'},
@@ -288,32 +378,35 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
         That fall-through is what makes the always-on toggle safe: with no live
         deform on the object, G/R/S behave exactly as they always did.
         """
-        ob = context.edit_object
-        if ob is None or ob.type != 'MESH':
-            return False
         space = context.space_data
         if space is None or space.type != 'VIEW_3D':
             return False
-        # Accept the object when a deform modifier exists at all. The edit-mode
+        obs = _editable_objects(context)
+        if not obs:
+            return False
+
+        # Accept an object when a deform modifier exists at all. The edit-mode
         # display flags are switched on during invoke, because a freshly added
         # Curve modifier ships with them off - gating on them here is what made
         # the toggle look dead on a normal hair card.
+        #
+        # In a multi-object session it is enough that ONE object qualifies and
+        # has a selection; the others simply do not contribute.
         prefs = _prefs()
         include_ns = bool(prefs and prefs.include_nonseparable)
-        if prefs is not None and not prefs.auto_enable_cage:
-            if not solver.has_editmode_deform(ob):
-                return False
-        elif not solver.deformers_for_edit(ob, include_ns):
-            return False
-
-        # Proportional editing and snapping are both supported in deform space,
-        # so the override stays active for them. Nothing else here should take
-        # the key away from the user.
-
-        try:
-            return ob.data.total_vert_sel > 0
-        except Exception:
-            return False
+        strict = prefs is not None and not prefs.auto_enable_cage
+        for ob in obs:
+            if strict:
+                if not solver.has_editmode_deform(ob):
+                    continue
+            elif not solver.deformers_for_edit(ob, include_ns):
+                continue
+            try:
+                if ob.data.total_vert_sel > 0:
+                    return True
+            except Exception:
+                continue
+        return False
 
     # -- state -------------------------------------------------------------
     def _draw_falloff(self, context):
@@ -359,9 +452,9 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
         gpu.state.blend_set('NONE')
 
     def _cleanup(self, context):
-        if getattr(self, "proxy", None) is not None:
-            self.proxy.free()
-            self.proxy = None
+        for isl in getattr(self, "islands", []):
+            isl.free()
+        self.proxy = None
         if context.area:
             context.area.header_text_set(None)
         if getattr(self, "_draw_handle", None) is not None:
@@ -379,11 +472,14 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             context.scene.tool_settings.use_snap = self.snap_base
 
     def _restore(self, context):
-        if not getattr(self, "orig", None):
-            return
-        for idx, co in self.orig.items():
-            self.bm.verts[idx].co = co
-        bmesh.update_edit_mesh(self.ob.data, loop_triangles=False, destructive=False)
+        for isl in getattr(self, "islands", []):
+            if not isl.orig:
+                continue
+            for idx, co in isl.orig.items():
+                isl.bm.verts[idx].co = co
+            bmesh.update_edit_mesh(isl.ob.data, loop_triangles=False,
+                                   destructive=False)
+            isl.warm = None
         self.warm = None
 
     def _header(self, context):
@@ -399,6 +495,8 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             bits.append("D %.4f" % self.last_delta.length)
         elif self.mode == 'ROTATE':
             bits.append("%.2f deg" % math.degrees(self.angle))
+        elif self.mode == 'SHRINK_FATTEN':
+            bits.append("offset %.4f" % getattr(self, "offset", 0.0))
         else:
             bits.append("x %.4f" % self.factor)
 
@@ -410,11 +508,15 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             else:
                 bits.append("snap %s (no target)" % el)
 
-        if self.weights:
+        n_prop = sum(len(i.weights) for i in getattr(self, "islands", []))
+        if n_prop:
             ts = context.scene.tool_settings
             bits.append("proportional %s r=%.3f (%d verts)"
                         % (ts.proportional_edit_falloff.lower(),
-                           ts.proportional_size, len(self.weights)))
+                           ts.proportional_size, n_prop))
+        n_obj = len(getattr(self, "islands", []))
+        if n_obj > 1:
+            bits.append("%d objects" % n_obj)
 
         if self.last_residual is not None:
             bits.append("err %.2gmm" % (self.last_residual * 1000.0))
@@ -427,60 +529,75 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
 
     # -- lifecycle ---------------------------------------------------------
     def invoke(self, context, event):
-        ob, bm, err = _edit_target(context)
-        if err:
-            self.report({'WARNING'}, err)
-            return {'CANCELLED'}
-
         prefs = _prefs()
         include_ns = bool(prefs and prefs.include_nonseparable)
         auto_cage = bool(prefs.auto_enable_cage) if prefs else True
 
-        if not solver.has_editmode_deform(ob):
-            # A freshly added Curve modifier has edit-mode display switched off,
-            # so the deformed shape is on screen but the cage is not. Switch the
-            # display flags on rather than silently doing nothing, which is
-            # indistinguishable from the addon being broken.
-            fixed = solver.enable_cage_display(ob, include_ns) if auto_cage else []
-            if fixed:
-                context.view_layer.update()
-                self.report({'INFO'},
-                            "Enabled edit-mode display for: %s" % ", ".join(fixed))
+        objects = _editable_objects(context)
+        if not objects:
+            return {'PASS_THROUGH'}
+
+        fixed_all = []
+        usable = []
+        for ob in objects:
             if not solver.has_editmode_deform(ob):
-                # Genuinely nothing to invert - let Blender's transform run.
-                return {'PASS_THROUGH'}
+                # A freshly added Curve modifier has edit-mode display switched
+                # off, so the deformed shape is on screen but the cage is not.
+                # Switch the flags on rather than silently doing nothing, which
+                # is indistinguishable from the addon being broken.
+                if auto_cage:
+                    fixed = solver.enable_cage_display(ob, include_ns)
+                    if fixed:
+                        fixed_all.extend("%s/%s" % (ob.name, f) for f in fixed)
+                if not solver.has_editmode_deform(ob):
+                    continue
+            usable.append(ob)
+        if fixed_all:
+            context.view_layer.update()
+            self.report({'INFO'},
+                        "Enabled edit-mode display for: %s" % ", ".join(fixed_all))
+        if not usable:
+            # Genuinely nothing to invert - let Blender's transform run.
+            return {'PASS_THROUGH'}
 
         self.max_iter = int(prefs.max_iterations) if prefs else 10
         self.tol = float(prefs.tolerance) if prefs else 1e-6
         eps = float(prefs.epsilon) if prefs else 1e-3
         self.eps = eps
 
-        bm.verts.ensure_lookup_table()
-        selected = [v.index for v in bm.verts if v.select and not v.hide]
-        if not selected:
-            return {'PASS_THROUGH'}
-
-        # Proportional editing drags unselected neighbours too, each by a
-        # weighted amount. Those vertices must be part of the solve, otherwise
-        # the falloff region simply would not move.
-        self.selected = selected
-
-        # Blender fixes proportional influence once, from the geometry as it was
-        # when the transform started. Snapshot every vertex up front so the
-        # falloff cannot crawl across the mesh as the drag moves things.
-        self.prop_origin = {v.index: v.co.copy() for v in bm.verts}
         self._draw_handle = None
-        self.weights = solver.proportional_weights(
-            context, ob, bm, selected, ob.matrix_world, self.prop_origin)
-        if self.weights:
-            indices = sorted(self.weights)
-        else:
-            indices = selected
 
-        self.ob = ob
-        self.bm = bm
-        self.indices = indices
-        self.orig = {i: bm.verts[i].co.copy() for i in indices}
+        # One island per object. Proportional editing drags unselected
+        # neighbours too, so each island solves for a superset of its own
+        # selection.
+        islands = []
+        for ob in usable:
+            bm = bmesh.from_edit_mesh(ob.data)
+            bm.verts.ensure_lookup_table()
+            sel = [v.index for v in bm.verts if v.select and not v.hide]
+            if not sel:
+                continue
+            isl = _Island(ob, bm, sel)
+            # Blender fixes proportional influence once, from the geometry as it
+            # was when the transform started. Snapshot every vertex up front so
+            # the falloff cannot crawl across the mesh as the drag moves things.
+            isl.prop_origin = {v.index: v.co.copy() for v in bm.verts}
+            isl.weights = solver.proportional_weights(
+                context, ob, bm, sel, ob.matrix_world, isl.prop_origin)
+            isl.indices = sorted(isl.weights) if isl.weights else list(sel)
+            isl.orig = {i: bm.verts[i].co.copy() for i in isl.indices}
+            islands.append(isl)
+
+        if not islands:
+            return {'PASS_THROUGH'}
+        self.islands = islands
+
+        # The active object stays the reference for the local axis frame and
+        # for anything that still needs a single object.
+        primary = islands[0]
+        self.ob = primary.ob
+        self.bm = primary.bm
+        self.selected = primary.selected
         self.axis = None
         self.axis_local = False
         self.plane = False
@@ -488,6 +605,7 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
         self.last_delta = Vector((0.0, 0.0, 0.0))
         self.angle = 0.0
         self.factor = 1.0
+        self.offset = 0.0
         self.last_residual = None
         self.folded = 0
         self.warm = None
@@ -498,46 +616,77 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
         self.snap_anchor = None
         self.snap_base = context.scene.tool_settings.use_snap
 
-        # One BVH build per drag: rebuilding per mouse-move is far too slow on
-        # a dense scalp mesh.
+        # Built after start_deformed exists, further down.
         self.snap_ctx = None
-        if context.scene.tool_settings.use_snap:
-            try:
-                sc = solver.SnapContext(context, ob)
-                if sc.build():
-                    self.snap_ctx = sc
-            except Exception:
-                self.snap_ctx = None
-        if not hasattr(self, "weights"):
-            self.weights = {}
+        # Mirror the active object's weights under the original name.
+        self.weights = primary.weights
         self.start_mouse = Vector((event.mouse_region_x, event.mouse_region_y))
         self.precision_anchor = None
 
-        self.proxy = solver.DeformProxy(ob, bm, include_ns)
         try:
-            self.proxy.build()
-            self.jac, base_eval = self.proxy.jacobian(indices, eps)
+            for isl in self.islands:
+                isl.proxy = solver.DeformProxy(isl.ob, isl.bm, include_ns)
+                isl.proxy.build()
+                isl.jac, base_eval = isl.proxy.jacobian(isl.indices, eps)
+                mw = isl.proxy.matrix_world
+                isl.start_deformed = {i: mw @ solver._get(base_eval, i)
+                                      for i in isl.indices}
         except Exception as exc:
             self._cleanup(context)
             self.report({'ERROR'}, "Could not evaluate the deform: %s" % exc)
             return {'CANCELLED'}
 
-        mw = self.proxy.matrix_world
-        self.start_deformed = {i: mw @ solver._get(base_eval, i) for i in indices}
+        self.proxy = primary.proxy
+        self.jac = primary.jac
 
-        active = solver.active_vert_index(bm)
-        self.pivot = _pivot_world(context, indices, self.start_deformed, active)
+        # Pivot and selection statistics span every object, exactly as Blender's
+        # own transform does in a multi-object session.
+        all_deformed = {}
+        all_indices = []
+        for n, isl in enumerate(self.islands):
+            for i in isl.indices:
+                key = (n, i)
+                all_deformed[key] = isl.start_deformed[i]
+                all_indices.append(key)
+        self.start_deformed = all_deformed
+        self.indices = all_indices
+
+        # Visible normals for Shrink/Fatten, keyed like the other maps.
+        self.deformed_normals = {}
+        for n, isl in enumerate(self.islands):
+            local = [i for (m, i) in all_indices if m == n]
+            for i, nrm in _visible_normals(isl.ob, local).items():
+                self.deformed_normals[(n, i)] = nrm
+
+        # One BVH build per drag: rebuilding per mouse-move is far too slow on
+        # a dense scalp mesh. The dragged vertices are excluded so the anchor
+        # cannot snap onto the geometry it is carrying.
+        if context.scene.tool_settings.use_snap:
+            try:
+                excl = [all_deformed[k] for k in all_indices]
+                sc = solver.SnapContext(
+                    context, [i.ob for i in self.islands], exclude_points=excl)
+                if sc.build():
+                    self.snap_ctx = sc
+            except Exception:
+                self.snap_ctx = None
+
+        active = solver.active_vert_index(primary.bm)
+        active_key = (0, active) if active is not None else None
+        self.pivot = _pivot_world(context, all_indices, all_deformed, active_key)
 
         # Snap With: which point of the selection is the one that lands on the
         # target. Blender offers Closest / Center / Median / Active.
+        sel_keys = [(n, i) for n, isl in enumerate(self.islands)
+                    for i in isl.selected]
         self.snap_anchor = _snap_anchor_world(
-            context, self.selected, self.start_deformed, active, self.pivot)
+            context, sel_keys, all_deformed, active_key, self.pivot)
         self.depth_point = self.pivot.copy()
 
         # Local axes come from the deformed frame, so "local X" means along the
         # card as drawn, not along the undeformed cage.
         self.local_frame = solver.orthonormalize(
-            self.proxy.matrix3 @ self.jac[indices[0]])
+            primary.proxy.matrix3 @ primary.jac[primary.indices[0]])
 
         region = context.region
         rv3d = context.region_data
@@ -557,6 +706,18 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             ref = Vector((1.0, 0.0))
         self.ref_vec = ref
         self.ref_len = max(ref.length, 1e-6)
+
+        # World units per screen pixel at the selection's depth. Shrink/Fatten
+        # needs this so a drag means the same thickness whatever the zoom.
+        try:
+            p_a = view3d_utils.region_2d_to_location_3d(
+                region, rv3d, self.pivot_2d, self.pivot)
+            p_b = view3d_utils.region_2d_to_location_3d(
+                region, rv3d, self.pivot_2d + Vector((100.0, 0.0)),
+                self.pivot)
+            self.world_per_px = max((p_b - p_a).length / 100.0, 1e-9)
+        except Exception:
+            self.world_per_px = 0.01
         self.prev_angle_raw = 0.0
         self.accum_angle = 0.0
 
@@ -615,6 +776,29 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             f = 1.0 + (f - 1.0) * 0.1
         return f
 
+    def _mouse_offset(self, event):
+        """Shrink/Fatten offset in Blender units, from mouse distance.
+
+        Mirrors Blender: moving away from the selection fattens, moving toward
+        it shrinks, and the scale is tied to how big the selection looks on
+        screen so it feels the same whether zoomed in or out.
+        """
+        cur = Vector((event.mouse_region_x, event.mouse_region_y))
+        start = self.start_mouse
+        ref = max(getattr(self, "ref_len", 100.0), 1.0)
+        # signed by whether the cursor moved away from the pivot or toward it
+        d_now = (cur - self.pivot_2d).length
+        d_start = (start - self.pivot_2d).length
+        px = d_now - d_start
+        scale = getattr(self, "offset_scale", None)
+        if scale is None:
+            # world units per pixel, from the selection's on-screen size
+            scale = getattr(self, "world_per_px", 0.01)
+        off = px * scale
+        if self.precision:
+            off *= 0.1
+        return off
+
     def _axis_vector(self):
         if self.axis is None:
             return None
@@ -642,33 +826,73 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
         the whole working set is rebuilt - including their original positions,
         which is what a cancel restores to.
         """
-        self.weights = solver.proportional_weights(
-            context, self.ob, self.bm, self.selected, self.ob.matrix_world,
-            self.prop_origin)
-        indices = sorted(self.weights) if self.weights else list(self.selected)
+        all_indices = []
+        all_deformed = {}
+        for n, isl in enumerate(self.islands):
+            isl.weights = solver.proportional_weights(
+                context, isl.ob, isl.bm, isl.selected, isl.ob.matrix_world,
+                isl.prop_origin)
+            indices = sorted(isl.weights) if isl.weights else list(isl.selected)
 
-        new = [i for i in indices if i not in self.orig]
-        if new:
-            for i in new:
-                self.orig[i] = self.bm.verts[i].co.copy()
-            # Newly included vertices need their undeformed start recorded too.
-            jac, base_eval = self.proxy.jacobian(indices, self.eps)
-            self.jac = jac
-            mw = self.proxy.matrix_world
-            self.start_deformed = {i: mw @ solver._get(base_eval, i)
-                                   for i in indices}
-        # Vertices that dropped out of range must go back where they started.
-        for i in list(self.indices):
-            if i not in indices and i in self.orig:
-                self.bm.verts[i].co = self.orig[i]
-        self.indices = indices
+            fresh = [i for i in indices if i not in isl.orig]
+            if fresh:
+                for i in fresh:
+                    isl.orig[i] = isl.bm.verts[i].co.copy()
+                # Newly included vertices need their undeformed start too.
+                jac, base_eval = isl.proxy.jacobian(indices, self.eps)
+                isl.jac = jac
+                mw = isl.proxy.matrix_world
+                isl.start_deformed = {i: mw @ solver._get(base_eval, i)
+                                      for i in indices}
+            # Vertices that dropped out of range go back where they started.
+            for i in list(isl.indices):
+                if i not in indices and i in isl.orig:
+                    isl.bm.verts[i].co = isl.orig[i]
+            isl.indices = indices
+            isl.warm = None
+            for i in indices:
+                all_indices.append((n, i))
+                all_deformed[(n, i)] = isl.start_deformed[i]
+
+        self.indices = all_indices
+        self.start_deformed = all_deformed
+
+        # Widening the proportional radius pulls in vertices that had no
+        # normal captured yet; without this Shrink/Fatten would leave them
+        # behind while everything else moved.
+        self.deformed_normals = {}
+        for n, isl in enumerate(self.islands):
+            local = [i for (m, i) in all_indices if m == n]
+            for i, nrm in _visible_normals(isl.ob, local).items():
+                self.deformed_normals[(n, i)] = nrm
+        self.jac = self.islands[0].jac
+        self.weights = self.islands[0].weights
         self.warm = None
 
-    def _weight(self, i):
-        """Proportional-edit influence for this vertex (1.0 when it is off)."""
-        if not self.weights:
-            return 1.0
-        return self.weights.get(i, 0.0)
+    # -- primary-island views -------------------------------------------
+    # Multi-object edit keeps state per object. These expose the active
+    # object's slice under the original names so single-object callers and
+    # diagnostics keep working unchanged.
+    @property
+    def orig(self):
+        isl = getattr(self, "islands", None)
+        return isl[0].orig if isl else {}
+
+    @property
+    def prop_origin(self):
+        isl = getattr(self, "islands", None)
+        return isl[0].prop_origin if isl else {}
+
+    @property
+    def vert_indices(self):
+        """Plain vertex indices for the active object."""
+        isl = getattr(self, "islands", None)
+        return list(isl[0].indices) if isl else []
+
+    def _weight(self, key):
+        """Proportional-edit influence for a (island, vertex) key."""
+        n, i = key
+        return self.islands[n].weight(i)
 
     def _targets_for(self, context, event):
         """World-space target position per affected vertex.
@@ -688,9 +912,12 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             self.snapped = None
             if ts.use_snap:
                 anchor = self.snap_anchor + delta
+                mouse = Vector((event.mouse_region_x, event.mouse_region_y))
                 try:
                     hit = solver.apply_snap(context, anchor.copy(),
-                                            self.snap_ctx, self.snap_anchor)
+                                            self.snap_ctx, self.snap_anchor,
+                                            region=self.region, rv3d=self.rv3d,
+                                            mouse=mouse)
                 except Exception:
                     hit = None
                 if hit is not None and (hit - anchor).length > 1e-9:
@@ -717,6 +944,28 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
                 out[i] = pivot + rot @ (self.start_deformed[i] - pivot)
             return out
 
+        if self.mode == 'SHRINK_FATTEN':
+            # Blender's own Alt+S moves the CAGE vertex along its normal by a
+            # fixed amount. When curve point radius varies - any tapered hair
+            # card - the modifier scales that offset differently along the
+            # card, so an identical drag yields between 0.51x and 1.0x of the
+            # requested thickness on screen. Here the offset is applied to the
+            # VISIBLE position along the VISIBLE normal, so what is asked for
+            # is what appears.
+            self.offset = self._mouse_offset(event)
+            out = {}
+            for i in self.indices:
+                w = self._weight(i)
+                if w <= 0.0:
+                    out[i] = self.start_deformed[i]
+                    continue
+                n = self.deformed_normals.get(i)
+                if n is None:
+                    out[i] = self.start_deformed[i]
+                    continue
+                out[i] = self.start_deformed[i] + n * (self.offset * w)
+            return out
+
         # RESIZE
         self.factor = self._mouse_factor(event)
         pivot = self.pivot
@@ -739,36 +988,49 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
         return out
 
     def _apply(self, context, world_targets):
-        mw_inv = self.proxy.matrix_world_inv
-        targets = {i: mw_inv @ p for i, p in world_targets.items()}
+        """Solve each object against its own modifier stack.
 
-        coords, residual, _ = self.proxy.solve_targets(
-            targets, jac=self.jac, max_iter=self.max_iter, tol=self.tol,
-            eps=self.eps, start=self.warm)
-
-        for i, co in coords.items():
-            self.bm.verts[i].co = co
-        bmesh.update_edit_mesh(self.ob.data, loop_triangles=False, destructive=False)
-
-        # Reuse this frame's answer as the next frame's starting point.
-        self.warm = coords
-
-        # Judge the residual against how far anything actually had to move.
+        Objects in a shared Edit Mode session have independent deform stacks and
+        matrices, so the inverse has to run per object rather than once for the
+        active one.
+        """
+        worst = 0.0
+        folded = 0
         moved = 0.0
-        for i in self.indices:
-            d = (world_targets[i] - self.start_deformed[i]).length
+        for key, p in world_targets.items():
+            d = (p - self.start_deformed[key]).length
             if d > moved:
                 moved = d
         scale = max(moved, 1e-9)
 
-        worst = 0.0
-        folded = 0
-        for r in residual.values():
-            length = r.length
-            if length > worst:
-                worst = length
-            if length > 0.01 * scale:
-                folded += 1
+        for n, isl in enumerate(self.islands):
+            sub = {i: world_targets[(n, i)] for i in isl.indices
+                   if (n, i) in world_targets}
+            if not sub:
+                continue
+            mw_inv = isl.proxy.matrix_world_inv
+            targets = {i: mw_inv @ p for i, p in sub.items()}
+
+            coords, residual, _ = isl.proxy.solve_targets(
+                targets, jac=isl.jac, max_iter=self.max_iter, tol=self.tol,
+                eps=self.eps, start=isl.warm)
+
+            for i, co in coords.items():
+                isl.bm.verts[i].co = co
+            bmesh.update_edit_mesh(isl.ob.data, loop_triangles=False,
+                                   destructive=False)
+
+            # Reuse this frame's answer as the next frame's starting point.
+            isl.warm = coords
+
+            for r in residual.values():
+                length = r.length
+                if length > worst:
+                    worst = length
+                if length > 0.01 * scale:
+                    folded += 1
+
+        self.warm = self.islands[0].warm if self.islands else None
         self.folded = folded
         self.last_residual = worst
 
@@ -792,7 +1054,10 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             ts.use_snap = (event.value == 'PRESS') != self.snap_base
             if ts.use_snap and self.snap_ctx is None:
                 try:
-                    sc = solver.SnapContext(context, self.ob)
+                    excl = [self.start_deformed[k] for k in self.indices]
+                    sc = solver.SnapContext(
+                        context, [i.ob for i in self.islands],
+                        exclude_points=excl)
                     if sc.build():
                         self.snap_ctx = sc
                 except Exception:

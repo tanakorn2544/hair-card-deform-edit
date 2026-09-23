@@ -25,11 +25,16 @@ def _refresh():
     except Exception:
         pass
 
-# key -> (operator mode, description)
+# key -> (operator mode, modifiers)
+# Alt+S is Blender's Shrink/Fatten. It offsets the CAGE vertex along its
+# normal, and the modifier then rescales that offset, so on a card whose curve
+# radius varies the same drag gives between 0.51x and 1.0x of the thickness
+# asked for. Ours offsets along the visible normal instead.
 _BINDINGS = (
-    ('G', 'TRANSLATE'),
-    ('R', 'ROTATE'),
-    ('S', 'RESIZE'),
+    ('G', 'TRANSLATE', {}),
+    ('R', 'ROTATE', {}),
+    ('S', 'RESIZE', {}),
+    ('S', 'SHRINK_FATTEN', {'alt': True}),
 )
 
 
@@ -45,8 +50,9 @@ def enable():
     if kc is None:
         return False
     km = kc.keymaps.new(name="Mesh", space_type='EMPTY')
-    for key, mode in _BINDINGS:
-        kmi = km.keymap_items.new("hair_deform_edit.transform", key, 'PRESS')
+    for key, mode, mods in _BINDINGS:
+        kmi = km.keymap_items.new("hair_deform_edit.transform", key, 'PRESS',
+                                  **mods)
         kmi.properties.mode = mode
         _items.append((km, kmi))
     _refresh()

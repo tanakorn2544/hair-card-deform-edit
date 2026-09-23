@@ -775,24 +775,62 @@ class SnapContext:
     unless "Snap onto Itself" is enabled.
     """
 
-    def __init__(self, context, edited):
+    def __init__(self, context, edited, exclude_points=None):
         self.context = context
-        self.edited = edited
+        self.edit_targets = []
+        # World-space positions of the vertices being dragged. Blender never
+        # snaps the moving selection onto itself; without this the anchor locks
+        # onto the very vertex it is carrying and the drag appears frozen.
+        self.exclude_points = list(exclude_points or ())
+        self.exclude_r2 = 1e-6
+        self.screen_ready = False
+        self.screen_verts = []
+        self.screen_edges = []
+        self.screen_faces = []
+        self.edge_segments = []
+        # ``edited`` may be a single object or every object in a shared Edit
+        # Mode session; all of them must be excluded from their own snapping.
+        if edited is None:
+            self.edited = set()
+        elif hasattr(edited, "__iter__"):
+            self.edited = set(edited)
+        else:
+            self.edited = {edited}
         self.trees = []      # (object, BVHTree, matrix_world)
         self.ok = False
 
     def build(self):
+        """Collect snap targets.
+
+        BVHTree.FromObject returns an EMPTY tree for an object that is in Edit
+        Mode - verified: find_nearest gives None there while the same call works
+        in Object Mode. Snapping onto the mesh being edited (the normal case
+        when every hair card lives in one object) therefore has to go through
+        scene.ray_cast, which does see the edit-mode result.
+        """
         from mathutils.bvhtree import BVHTree
         ctx = self.context
         ts = ctx.scene.tool_settings
         dg = ctx.evaluated_depsgraph_get()
-        include_self = getattr(ts, "use_snap_self", False)
+        # Blender's own defaults: snapping onto the edited mesh is ON.
+        include_self = getattr(ts, "use_snap_self", True)
+        include_edit = getattr(ts, "use_snap_edit", True)
+        include_nonedit = getattr(ts, "use_snap_nonedit", True)
+
+        self.edit_targets = []
         for ob in ctx.view_layer.objects:
             if ob.type != 'MESH':
                 continue
-            if ob is self.edited and not include_self:
-                continue
             if not ob.visible_get():
+                continue
+            is_edited = ob in self.edited
+            if is_edited:
+                if not (include_self and include_edit):
+                    continue
+                # cannot be BVH'd while in edit mode - use the scene raycast
+                self.edit_targets.append(ob)
+                continue
+            if not include_nonedit:
                 continue
             try:
                 tree = BVHTree.FromObject(ob, dg)
@@ -800,15 +838,43 @@ class SnapContext:
                 continue
             if tree is not None:
                 self.trees.append((ob, tree, ob.matrix_world.copy()))
-        self.ok = bool(self.trees)
+        self.ok = bool(self.trees) or bool(self.edit_targets)
         return self.ok
+
+    def _raycast_edit(self, origin, direction):
+        """Ray against objects in Edit Mode, via the scene (BVH cannot)."""
+        if not self.edit_targets:
+            return None, None, None
+        try:
+            dg = self.context.evaluated_depsgraph_get()
+            ok, loc, nrm, idx, obj, mat = self.context.scene.ray_cast(
+                dg, origin, direction)
+        except Exception:
+            return None, None, None
+        if not ok or obj is None:
+            return None, None, None
+        # scene.ray_cast hands back the EVALUATED object, which is a distinct
+        # datablock from the original - an identity test against the originals
+        # always fails and silently discards every hit.
+        orig = getattr(obj, "original", None) or obj
+        for t in self.edit_targets:
+            if t == orig or t.name == orig.name:
+                return Vector(loc), t, idx
+        return None, None, None
 
     # -- individual snap modes -------------------------------------------
     def _face_data(self, ob, index):
+        """World-space corners of one evaluated face.
+
+        Works for objects in Edit Mode too: evaluated_get().to_mesh() returns
+        the deformed cage there, which is what is on screen.
+        """
         dg = self.context.evaluated_depsgraph_get()
         evo = ob.evaluated_get(dg)
         me = evo.to_mesh()
         try:
+            if index is None or index < 0 or index >= len(me.polygons):
+                return [], None
             poly = me.polygons[index]
             mw = ob.matrix_world
             pts = [mw @ me.vertices[i].co.copy() for i in poly.vertices]
@@ -816,6 +882,293 @@ class SnapContext:
         finally:
             evo.to_mesh_clear()
         return pts, centre
+
+    def collect_screen(self, region, rv3d):
+        """Cache every snap feature as a screen-space point.
+
+        Blender's vertex/edge snapping is a SCREEN-SPACE search: it takes the
+        feature nearest the cursor in pixels, whether or not the cursor is over
+        a face. Relying on a ray hit fails whenever the surface is edge-on to
+        the view - a flat hair card at a grazing angle is missed entirely, which
+        is exactly the case that looked like "snapping does nothing".
+
+        The view does not move during a modal transform, so this is built once.
+        """
+        from bpy_extras import view3d_utils
+
+        self.screen_verts = []   # (Vector2, Vector3)
+        self.screen_edges = []   # (Vector2, Vector3) midpoints
+        self.screen_faces = []   # (Vector2, Vector3) centres
+        self.edge_segments = []  # (world a, world b)
+
+        dg = self.context.evaluated_depsgraph_get()
+        objs = list(self.edit_targets) + [o for o, _t, _m in self.trees]
+        for ob in objs:
+            try:
+                evo = ob.evaluated_get(dg)
+                me = evo.to_mesh()
+            except Exception:
+                continue
+            try:
+                mw = ob.matrix_world
+                wco = [mw @ v.co.copy() for v in me.vertices]
+                for w in wco:
+                    p2 = view3d_utils.location_3d_to_region_2d(region, rv3d, w)
+                    if p2 is not None:
+                        self.screen_verts.append((p2, w))
+                for e in me.edges:
+                    a = wco[e.vertices[0]]
+                    b = wco[e.vertices[1]]
+                    self.edge_segments.append((a, b))
+                    mid = (a + b) * 0.5
+                    p2 = view3d_utils.location_3d_to_region_2d(region, rv3d,
+                                                               mid)
+                    if p2 is not None:
+                        self.screen_edges.append((p2, mid))
+                for f in me.polygons:
+                    c = mw @ f.center.copy()
+                    p2 = view3d_utils.location_3d_to_region_2d(region, rv3d, c)
+                    if p2 is not None:
+                        self.screen_faces.append((p2, c))
+            finally:
+                try:
+                    evo.to_mesh_clear()
+                except Exception:
+                    pass
+        # Edge endpoints projected ONCE. The old code re-projected every edge
+        # on every mouse move - 2220 edges x 2 projections per frame, which
+        # measured 6.5ms of the 11.6ms frame on a 60-card scalp.
+        self.edge_screen = []
+        for a, b in self.edge_segments:
+            pa = view3d_utils.location_3d_to_region_2d(region, rv3d, a)
+            pb = view3d_utils.location_3d_to_region_2d(region, rv3d, b)
+            if pa is None or pb is None:
+                continue
+            self.edge_screen.append((pa, pb, a, b))
+
+        # Uniform grid over screen space so a search only visits nearby
+        # candidates instead of the whole mesh.
+        self._grid_cell = 64.0
+        self._grid = {}
+
+        def _bucket(store, p2, payload):
+            key = (int(p2.x // self._grid_cell), int(p2.y // self._grid_cell))
+            store.setdefault(key, []).append(payload)
+
+        for p2, w in self.screen_verts:
+            _bucket(self._grid, p2, ('V', p2, w))
+        for p2, w in self.screen_edges:
+            _bucket(self._grid, p2, ('M', p2, w))
+        for p2, w in self.screen_faces:
+            _bucket(self._grid, p2, ('F', p2, w))
+        for pa, pb, a, b in self.edge_screen:
+            mid = (pa + pb) * 0.5
+            _bucket(self._grid, mid, ('E', (pa, pb, a, b), None))
+
+        self.screen_ready = True
+        return len(self.screen_verts)
+
+    def _grid_near(self, mouse, radius_px):
+        """Candidates whose screen cell is within radius of the cursor."""
+        cell = getattr(self, "_grid_cell", 64.0)
+        grid = getattr(self, "_grid", None)
+        if not grid:
+            return None
+        span = int(radius_px // cell) + 1
+        cx = int(mouse.x // cell)
+        cy = int(mouse.y // cell)
+        out = []
+        for gx in range(cx - span, cx + span + 1):
+            for gy in range(cy - span, cy + span + 1):
+                b = grid.get((gx, gy))
+                if b:
+                    out.extend(b)
+        return out
+
+    def nearest_on_screen(self, region, rv3d, mouse, elements, max_px=None):
+        """Feature nearest the cursor in pixels, as Blender's snapping works.
+
+        Only candidates in nearby screen cells are examined, and edges use the
+        projection cached at collect_screen time. Walking every vertex and
+        re-projecting every edge each frame cost 11.6ms on a 60-card scalp,
+        which is the lag that showed up in real use.
+        """
+        if not getattr(self, "screen_ready", False):
+            self.collect_screen(region, rv3d)
+        if max_px is None:
+            max_px = _snap_pixel_radius(self.context)
+
+        want_v = 'VERTEX' in elements
+        want_m = 'EDGE_MIDPOINT' in elements
+        want_f = bool(elements & {'FACE', 'FACE_NEAREST', 'FACE_PROJECT'})
+        want_e = bool(elements & {'EDGE', 'EDGE_PERPENDICULAR'})
+
+        best, best_px = None, 1e30
+
+        # A generous search radius: the cursor may sit outside the snap
+        # radius while an edge running past it is still within range.
+        cands = self._grid_near(mouse, max_px * 2.0)
+        if cands is None:
+            cands = []
+            for p2, w in self.screen_verts:
+                cands.append(('V', p2, w))
+            for p2, w in self.screen_edges:
+                cands.append(('M', p2, w))
+            for p2, w in self.screen_faces:
+                cands.append(('F', p2, w))
+            for pa, pb, a, b in getattr(self, "edge_screen", ()):
+                cands.append(('E', (pa, pb, a, b), None))
+
+        for kind, data, w in cands:
+            if kind == 'E':
+                if not want_e:
+                    continue
+                pa, pb, a, b = data
+                ab = pb - pa
+                L = ab.length_squared
+                if L < 1e-12:
+                    continue
+                t = (mouse - pa).dot(ab) / L
+                t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                p2 = pa + ab * t
+                d = (p2 - mouse).length
+                if d >= best_px:
+                    continue
+                wpt = a + (b - a) * t
+                if self._excluded(wpt):
+                    continue
+                best_px, best = d, wpt
+                continue
+
+            if kind == 'V' and not want_v:
+                continue
+            if kind == 'M' and not want_m:
+                continue
+            if kind == 'F' and not want_f:
+                continue
+            d = (data - mouse).length
+            if d >= best_px:
+                continue
+            if self._excluded(w):
+                continue
+            best_px, best = d, w
+
+        if best is not None and best_px <= max_px:
+            return best, best_px
+        return None, 1e30
+
+    def under_mouse(self, region, rv3d, mouse, elements, max_px=None):
+        """Snap to what the cursor is pointing at, the way Blender does.
+
+        Primary path is a SCREEN-SPACE search (nearest_on_screen). A ray hit is
+        only consulted for surface-type elements, where the point on the face
+        itself matters. Ray-first was wrong: a flat hair card seen edge-on is
+        missed by the ray entirely, so snapping appeared to do nothing on
+        exactly the geometry this addon exists for.
+        """
+        from bpy_extras import view3d_utils
+
+        if not self.trees and not self.edit_targets:
+            return None, 1e30
+        if max_px is None:
+            max_px = _snap_pixel_radius(self.context)
+
+        best, best_px = self.nearest_on_screen(region, rv3d, mouse, elements,
+                                               max_px)
+
+        # For face snapping the exact point on the surface beats the centre,
+        # when the cursor really is over a face.
+        if elements & {'FACE', 'FACE_NEAREST', 'FACE_PROJECT'}:
+            origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse)
+            direction = view3d_utils.region_2d_to_vector_3d(region, rv3d,
+                                                            mouse)
+            loc, obj, idx = self._raycast_edit(origin, direction)
+            if loc is None:
+                hit_d = 1e30
+                for ob, tree, mw in self.trees:
+                    inv = mw.inverted()
+                    l_org = inv @ origin
+                    l_dir = (inv.to_3x3() @ direction).normalized()
+                    try:
+                        hloc, hnrm, hidx, hdist = tree.ray_cast(l_org, l_dir)
+                    except Exception:
+                        continue
+                    if hloc is None:
+                        continue
+                    w = mw @ hloc
+                    d = (w - origin).length
+                    if d < hit_d:
+                        hit_d, loc, obj, idx = d, w, ob, hidx
+            if loc is not None and not self._excluded(loc):
+                p2 = view3d_utils.location_3d_to_region_2d(region, rv3d, loc)
+                if p2 is not None:
+                    d_px = (p2 - mouse).length
+                    if d_px <= max_px and d_px < best_px:
+                        best, best_px = loc, d_px
+
+        if best is None:
+            return None, 1e30
+        return best, best_px
+
+    def _excluded(self, point):
+        """True when this candidate is one of the vertices being dragged.
+
+        Hashed to a coarse grid: a linear scan ran once per candidate per
+        frame, which is O(candidates x selection) on every mouse move.
+        """
+        if not self.exclude_points:
+            return False
+        keys = getattr(self, "_excl_keys", None)
+        if keys is None:
+            q = 1e-3
+            keys = set()
+            for p in self.exclude_points:
+                keys.add((round(p.x / q), round(p.y / q), round(p.z / q)))
+            self._excl_keys = keys
+            self._excl_q = q
+        q = self._excl_q
+        kx, ky, kz = (round(point.x / q), round(point.y / q),
+                      round(point.z / q))
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    if (kx + dx, ky + dy, kz + dz) in keys:
+                        return True
+        return False
+
+    def _candidates(self, ob, idx, loc, elements):
+        """Snap features of one face: the surface point, its verts, edges."""
+        cands = []
+        if 'FACE' in elements or 'FACE_NEAREST' in elements or \
+                'FACE_PROJECT' in elements:
+            cands.append(loc)
+        if idx is None:
+            return cands
+        if not (elements & {'VERTEX', 'EDGE', 'EDGE_MIDPOINT',
+                            'EDGE_PERPENDICULAR'}):
+            return cands
+        try:
+            pts, centre = self._face_data(ob, idx)
+        except Exception:
+            return cands
+        if not pts:
+            return cands
+        if 'VERTEX' in elements:
+            cands.extend(pts)
+        if 'EDGE' in elements or 'EDGE_PERPENDICULAR' in elements:
+            for i in range(len(pts)):
+                a = pts[i]
+                b = pts[(i + 1) % len(pts)]
+                ab = b - a
+                L = ab.length_squared
+                if L < 1e-18:
+                    continue
+                t = max(0.0, min(1.0, (loc - a).dot(ab) / L))
+                cands.append(a + ab * t)
+        if 'EDGE_MIDPOINT' in elements:
+            for i in range(len(pts)):
+                cands.append((pts[i] + pts[(i + 1) % len(pts)]) / 2.0)
+        return cands
 
     def nearest(self, point, elements):
         """Best snap position for ``point``, or None when nothing is in range.
@@ -827,9 +1180,16 @@ class SnapContext:
         best = None
         best_d = 1e30
         for ob, tree, mw in self.trees:
-            loc, nrm, idx, dist = tree.find_nearest(point)
+            # The tree lives in the object's local space; _face_data returns
+            # world space. Mixing the two silently snaps to the wrong place.
+            try:
+                inv = mw.inverted()
+            except Exception:
+                continue
+            loc, nrm, idx, dist = tree.find_nearest(inv @ point)
             if loc is None:
                 continue
+            loc = mw @ loc
             cands = []
             if 'FACE' in elements or 'FACE_NEAREST' in elements or \
                     'FACE_PROJECT' in elements:
@@ -879,7 +1239,16 @@ def increment_step(context):
     return scale
 
 
-def apply_snap(context, point, snap_ctx, start=None):
+def _snap_pixel_radius(context):
+    """How near the cursor a feature must be, in pixels, to snap to it."""
+    try:
+        return float(context.preferences.view.ui_scale) * 35.0
+    except Exception:
+        return 35.0
+
+
+def apply_snap(context, point, snap_ctx, start=None, region=None, rv3d=None,
+               mouse=None):
     """Snap a world-space target according to the scene's snap settings.
 
     Returns the possibly-adjusted point. INCREMENT/GRID quantise the movement;
@@ -907,6 +1276,15 @@ def apply_snap(context, point, snap_ctx, start=None):
 
     if snap_ctx is None or not snap_ctx.ok:
         return point
+
+    # Blender snaps to the feature under the cursor. Use the mouse ray whenever
+    # the caller can supply it, and only fall back to nearest-in-3D otherwise.
+    if region is not None and rv3d is not None and mouse is not None:
+        hit, _px = snap_ctx.under_mouse(region, rv3d, mouse, elements)
+        if hit is None:
+            return point
+        return hit
+
     hit, dist = snap_ctx.nearest(point, elements)
     if hit is None:
         return point

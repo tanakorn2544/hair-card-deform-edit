@@ -33,6 +33,8 @@ _EXTRA = (
     ('G', "hair_deform_edit.transform", 'TRANSLATE'),
     ('R', "hair_deform_edit.transform", 'ROTATE'),
     ('S', "hair_deform_edit.transform", 'RESIZE'),
+    # Shift+Alt+S is already Scale above, so Shrink/Fatten takes F.
+    ('F', "hair_deform_edit.transform", 'SHRINK_FATTEN'),
     ('A', "hair_deform_edit.align_orientation", None),
 )
 

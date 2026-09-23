@@ -3,6 +3,10 @@
 Blender 4.2 add-on for editing hair cards that are bent by a Curve (or Lattice,
 Armature, Simple Deform) modifier.
 
+![demo](docs/demo.gif)
+
+Toggle off, then on. Same cards, same keys.
+
 ## The problem
 
 Put a Curve modifier on a hair card and edit it. The card on screen is bent, but

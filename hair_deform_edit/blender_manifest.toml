@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "hair_deform_edit"
+name = "Hair Card Deform Edit"
+version = "1.6.0"
+tagline = "Move, rotate, scale hair cards in the space you see"
+maintainer = "KornSensei"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-2.0-or-later",
+]
+
+tags = ["Mesh", "Modeling"]

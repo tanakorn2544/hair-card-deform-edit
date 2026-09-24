@@ -30,6 +30,23 @@ curve tapers, the same drag produces between 0.51x and 1.0x of the thickness you
 asked for - thin spots where the taper is tightest. Here the offset is applied
 to the visible position along the visible normal, so 1.0x lands everywhere.
 
+### Smooth Card
+
+Cards pushed around vertex by vertex end up with corners along their edges and
+faces of very different sizes. Vertex > Smooth Card (Ctrl+V), or the button in
+the sidebar panel, smooths the card in the shape you see:
+
+- Corners along the edges are taken out; the overall bend of the card is kept.
+- Card width is kept. Blender's Smooth Vertices collapses a bent card toward a
+  line and moves the root and tip.
+- The root, the tip and anything not selected never move.
+- Smooth (0-1) sets how much small detail is removed.
+- Spacing: Keep leaves the rows where they are along the card; Even also gives
+  every face the same length.
+
+On a bent test card with jagged edges, the sharpest corner went from 26 to 8
+degrees and the width error from 20% to 7%.
+
 ## Install
 
 Edit > Preferences > Add-ons > Install from Disk, pick the zip, enable it.

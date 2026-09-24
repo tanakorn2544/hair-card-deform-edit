@@ -173,6 +173,11 @@ class HAIRDEFORM_PT_panel(bpy.types.Panel):
 
         layout.separator()
         col = layout.column(align=True)
+        col.label(text="Clean Up")
+        col.operator("hair_deform_edit.smooth_card", icon='MOD_SMOOTH')
+
+        layout.separator()
+        col = layout.column(align=True)
         col.label(text="Transform Orientation")
         col.operator("hair_deform_edit.align_orientation", icon='ORIENTATION_LOCAL')
         row = col.row(align=True)

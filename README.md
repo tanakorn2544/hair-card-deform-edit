@@ -62,7 +62,9 @@ otherwise.
 ## Notes
 
 - Pivot point setting is respected, including 3D cursor.
-- Proportional falloff is fixed when the drag starts, same as Blender.
+- Proportional falloff is fixed when the drag starts, same as Blender. The
+  falloff distance is measured on the bent card you see, so a curved card
+  bends smoothly instead of kinking at the selection.
 - Multi-object edit mode is supported: every mesh in the session gets its own
   solve, and the selection moves as one rigid group like Blender's transform.
 - Snap targets are read off deformed geometry, so you snap onto what you see.

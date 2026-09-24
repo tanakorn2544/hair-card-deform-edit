@@ -667,40 +667,136 @@ def _falloff_weight(t, kind):
     return 1.0 - (3.0 * t * t - 2.0 * t * t * t)
 
 
-def connected_distances(bm, seeds, limit, origin=None):
-    """Shortest path length along edges from any seed, capped at ``limit``.
+def _geodesic_across_triangle(v0, v1, v2, d1, d2):
+    """Distance to v0, given distances d1 at v1 and d2 at v2.
 
-    Mirrors Blender's "Connected Only": influence travels along the surface, so
-    a vertex that is close in space but far along the mesh is not dragged.
+    Same estimate Blender's transform uses for Connected Only (a virtual
+    source unfolded into the triangle's plane), so the falloff follows the
+    surface the same way. Falls back to the shorter edge path.
     """
-    import heapq
-    dist = {i: 0.0 for i in seeds}
-    heap = [(0.0, i) for i in seeds]
-    heapq.heapify(heap)
-    while heap:
-        d, i = heapq.heappop(heap)
-        if d > dist.get(i, 1e30):
-            continue
-        if d > limit:
-            continue
-        v = bm.verts[i]
-        vco = origin[i] if (origin is not None and i in origin) else v.co
-        for e in v.link_edges:
-            o = e.other_vert(v)
-            oco = (origin[o.index]
-                   if (origin is not None and o.index in origin) else o.co)
-            nd = d + (oco - vco).length
-            if nd < dist.get(o.index, 1e30) and nd <= limit:
-                dist[o.index] = nd
-                heapq.heappush(heap, (nd, o.index))
-    return dist
+    v10 = v0 - v1
+    v12 = v2 - v1
+    if d1 != 0.0 and d2 != 0.0:
+        d12 = v12.length
+        if d12 * d12 > 0.0:
+            u = v12 / d12
+            n = v12.cross(v10)
+            if n.length > 0.0:
+                n.normalize()
+                w = n.cross(u)
+                x0 = v10.dot(u)
+                y0 = abs(v10.dot(w))
+                a = 0.5 * (1.0 + (d1 * d1 - d2 * d2) / (d12 * d12))
+                hh = d1 * d1 - a * a * d12 * d12
+                if hh > 0.0:
+                    h = math.sqrt(hh)
+                    sx, sy = a * d12, -h
+                    x_int = sx + h * (x0 - sx) / (y0 + h)
+                    if 0.0 <= x_int <= d12:
+                        return math.hypot(x0 - sx, y0 - sy)
+    return min(d1 + v10.length, d2 + (v0 - v2).length)
 
 
-def proportional_weights(context, ob, bm, selected, matrix_world, origin=None):
+def connected_distances(bm, seeds, limit, coords=None):
+    """Distance over the surface from the nearest seed - Blender's "Connected Only".
+
+    Influence travels along the mesh, so a vertex that is close in space but
+    far along the surface is not dragged. Distances are propagated along edges
+    and ACROSS faces (not just along edges): walking edges only overestimates
+    every diagonal and gives the far side of a card less pull than Blender does.
+
+    ``coords`` maps vertex index to the position to measure on (world space);
+    missing indices fall back to the vertex's own coordinate. Values beyond
+    ``limit`` carry no weight, so propagation stops a little past it.
+    """
+    bm.verts.ensure_lookup_table()
+    INF = float("inf")
+    stop = limit * 2.0
+
+    def co(v):
+        if coords is not None:
+            c = coords.get(v.index)
+            if c is not None:
+                return c
+        return v.co
+
+    dist = {}
+    for i in seeds:
+        dist[i] = 0.0
+    seedset = set(seeds)
+
+    def try_add(v0, v1, v2):
+        """Relax v0 from v1 (edge) or from v1 and v2 (across a face)."""
+        if v0.hide or v0.index in seedset:
+            return False
+        d0 = dist.get(v0.index, INF)
+        d1 = dist.get(v1.index, INF)
+        if d1 == INF or d0 <= d1:
+            return False
+        if v2 is not None:
+            d2 = dist.get(v2.index, INF)
+            if d2 == INF or d0 <= d2:
+                return False
+            nd = _geodesic_across_triangle(co(v0), co(v1), co(v2), d1, d2)
+        else:
+            nd = d1 + (co(v1) - co(v0)).length
+        if nd < d0 and nd <= stop:
+            dist[v0.index] = nd
+            return True
+        return False
+
+    queue = []
+    queued = set()
+    for i in seeds:
+        for e in bm.verts[i].link_edges:
+            if not e.hide and e.index not in queued:
+                queued.add(e.index)
+                queue.append(e)
+
+    while queue:
+        nxt = []
+        nxt_set = set()
+
+        def push(v, skip):
+            for e2 in v.link_edges:
+                if e2 is not skip and not e2.hide and e2.index not in nxt_set:
+                    nxt_set.add(e2.index)
+                    nxt.append(e2)
+
+        while queue:
+            e = queue.pop()
+            v1, v2 = e.verts
+            d1 = dist.get(v1.index, INF)
+            d2 = dist.get(v2.index, INF)
+            if not e.link_loops or d1 == INF or d2 == INF:
+                a_, b_ = (v1, v2) if d1 <= d2 else (v2, v1)
+                if try_add(b_, a_, None):
+                    push(b_, e)
+            for l in e.link_loops:
+                lo = l.link_loop_next.link_loop_next
+                while lo is not l:
+                    vo = lo.vert
+                    if try_add(vo, v1, v2):
+                        push(vo, e)
+                    elif try_add(vo, v1, None) or try_add(vo, v2, None):
+                        push(vo, e)
+                    lo = lo.link_loop_next
+        queue = nxt
+    return {i: d for i, d in dist.items() if d <= limit}
+
+
+def proportional_weights(context, ob, bm, selected, matrix_world, origin=None,
+                         world=None):
     """Weight per vertex index for the current proportional-edit settings.
 
     Returns {} when proportional editing is off. Selected vertices always weigh
     1.0. Distances are measured in world space, like Blender's.
+
+    ``world`` gives the VISIBLE (deformed) world position of every vertex. When
+    supplied, distances are measured on the card the user is looking at, not on
+    the undeformed cage. On a bent card the cage distances can be very
+    different from the visible ones, and measuring there gives the wrong
+    vertices the wrong share of the move - which shows up as a kink.
 
     ``origin`` supplies the ORIGINAL local coordinates ({index: Vector}) from
     before the drag started. Blender fixes proportional influence once at the
@@ -721,21 +817,43 @@ def proportional_weights(context, ob, bm, selected, matrix_world, origin=None):
 
     bm.verts.ensure_lookup_table()
 
+    if world is not None:
+        if ts.use_proportional_connected:
+            # Edge paths walked over the visible geometry, already in world
+            # units, so the radius needs no scale correction.
+            dist = connected_distances(bm, sel, size, world)
+            for i, d in dist.items():
+                if i in sel:
+                    continue
+                w = _falloff_weight(d / size, kind)
+                if w > 0.0:
+                    weights[i] = w
+            return weights
+        sel_world = [world[i] for i in selected if i in world]
+        for v in bm.verts:
+            if v.index in sel or v.hide or v.index not in world:
+                continue
+            pw = world[v.index]
+            best = min((pw - s).length for s in sel_world)
+            if best >= size:
+                continue
+            w = _falloff_weight(best / size, kind)
+            if w > 0.0:
+                weights[v.index] = w
+        return weights
+
     def co(i):
         if origin is not None and i in origin:
             return origin[i]
         return bm.verts[i].co
 
     if ts.use_proportional_connected:
-        # Edge-path distance is measured on the LOCAL mesh, then compared in
-        # world units, so scale the cap accordingly.
-        scale = _avg_scale(matrix_world)
-        local_limit = size / scale if scale > 1e-12 else size
-        dist = connected_distances(bm, sel, local_limit, origin)
-        for i, dl in dist.items():
+        cage = {v.index: matrix_world @ co(v.index) for v in bm.verts}
+        dist = connected_distances(bm, sel, size, cage)
+        for i, d in dist.items():
             if i in sel:
                 continue
-            w = _falloff_weight((dl * scale) / size, kind)
+            w = _falloff_weight(d / size, kind)
             if w > 0.0:
                 weights[i] = w
         return weights

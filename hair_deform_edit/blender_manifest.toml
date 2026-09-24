@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "hair_deform_edit"
 name = "Hair Card Deform Edit"
-version = "1.7.0"
+version = "1.7.1"
 tagline = "Move, rotate, scale hair cards in the space you see"
 maintainer = "KornSensei"
 type = "add-on"

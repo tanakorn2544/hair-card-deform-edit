@@ -219,7 +219,7 @@ class _Island:
     """
 
     __slots__ = ("ob", "bm", "selected", "indices", "weights", "prop_origin",
-                 "orig", "proxy", "jac", "start_deformed", "warm")
+                 "prop_world", "orig", "proxy", "jac", "start_deformed", "warm")
 
     def __init__(self, ob, bm, selected):
         self.ob = ob
@@ -228,6 +228,7 @@ class _Island:
         self.indices = list(selected)
         self.weights = {}
         self.prop_origin = {}
+        self.prop_world = None
         self.orig = {}
         self.proxy = None
         self.jac = None
@@ -429,9 +430,12 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
 
         radius = ts.proportional_size
         # A screen-facing circle, so it reads the same from any viewing angle.
+        # The ROWS of the view matrix are the screen axes in world space.
+        # Reading its columns instead gives two non-perpendicular vectors of
+        # the wrong length, and the circle draws as a tilted oval.
         vm = rv3d.view_matrix
-        right = Vector((vm[0][0], vm[1][0], vm[2][0]))
-        up = Vector((vm[0][1], vm[1][1], vm[2][1]))
+        right = Vector(vm[0][:3]).normalized()
+        up = Vector(vm[1][:3]).normalized()
         centre = self.pivot
 
         pts = []
@@ -582,14 +586,35 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
             # was when the transform started. Snapshot every vertex up front so
             # the falloff cannot crawl across the mesh as the drag moves things.
             isl.prop_origin = {v.index: v.co.copy() for v in bm.verts}
-            isl.weights = solver.proportional_weights(
-                context, ob, bm, sel, ob.matrix_world, isl.prop_origin)
-            isl.indices = sorted(isl.weights) if isl.weights else list(sel)
-            isl.orig = {i: bm.verts[i].co.copy() for i in isl.indices}
             islands.append(isl)
 
         if not islands:
             return {'PASS_THROUGH'}
+
+        try:
+            for isl in islands:
+                isl.proxy = solver.DeformProxy(isl.ob, isl.bm, include_ns)
+                isl.proxy.build()
+                # Falloff distances are measured on the card as it is SEEN.
+                # Measuring on the undeformed cage gives a bent card the wrong
+                # weights and kinks it where the selection meets the falloff.
+                isl.prop_world = None
+                if context.scene.tool_settings.use_proportional_edit:
+                    full = isl.proxy.evaluate()
+                    mw = isl.proxy.matrix_world
+                    isl.prop_world = {i: mw @ solver._get(full, i)
+                                      for i in range(isl.proxy.count)}
+                isl.weights = solver.proportional_weights(
+                    context, isl.ob, isl.bm, isl.selected,
+                    isl.ob.matrix_world, isl.prop_origin, isl.prop_world)
+                isl.indices = (sorted(isl.weights) if isl.weights
+                               else list(isl.selected))
+                isl.orig = {i: isl.bm.verts[i].co.copy() for i in isl.indices}
+        except Exception as exc:
+            for isl in islands:
+                isl.free()
+            self.report({'ERROR'}, "Could not evaluate the deform: %s" % exc)
+            return {'CANCELLED'}
         self.islands = islands
 
         # The active object stays the reference for the local axis frame and
@@ -625,8 +650,6 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
 
         try:
             for isl in self.islands:
-                isl.proxy = solver.DeformProxy(isl.ob, isl.bm, include_ns)
-                isl.proxy.build()
                 isl.jac, base_eval = isl.proxy.jacobian(isl.indices, eps)
                 mw = isl.proxy.matrix_world
                 isl.start_deformed = {i: mw @ solver._get(base_eval, i)
@@ -831,7 +854,7 @@ class HAIRDEFORM_OT_transform(bpy.types.Operator):
         for n, isl in enumerate(self.islands):
             isl.weights = solver.proportional_weights(
                 context, isl.ob, isl.bm, isl.selected, isl.ob.matrix_world,
-                isl.prop_origin)
+                isl.prop_origin, isl.prop_world)
             indices = sorted(isl.weights) if isl.weights else list(isl.selected)
 
             fresh = [i for i in indices if i not in isl.orig]

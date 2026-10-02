@@ -31,6 +31,13 @@ class HairDeformSettings(bpy.types.PropertyGroup):
         ),
         default='SELECTION',
     )
+    length_invert: BoolProperty(
+        name="Invert",
+        description=(
+            "Card Length grows the cards from the other end: the tip stays "
+            "and the root end moves. F while dragging swaps it for one go"),
+        default=False,
+    )
 
 
 class HairDeformPrefs(bpy.types.AddonPreferences):
@@ -97,11 +104,18 @@ class HAIRDEFORM_PT_panel(bpy.types.Panel):
     @classmethod
     def poll(cls, context):
         ob = context.object
-        return ob is not None and ob.type == 'MESH'
+        return ob is not None and ob.type in {'MESH', 'CURVE'}
 
     def draw(self, context):
         layout = self.layout
         ob = context.object
+        if ob.type == 'CURVE':
+            col = layout.column(align=True)
+            col.label(text="Curve: %s" % ob.name, icon='CURVE_BEZCURVE')
+            col.operator("hair_deform_edit.jump_curve",
+                         text="Back to Card", icon='LOOP_BACK')
+            col.label(text="Shift+Alt+C")
+            return
         settings = context.scene.hair_deform_edit
         prefs = ops._prefs()
 
@@ -159,6 +173,8 @@ class HAIRDEFORM_PT_panel(bpy.types.Panel):
 
         if context.mode != 'EDIT_MESH':
             layout.label(text="Enter Edit Mode to use the tools", icon='INFO')
+            layout.operator("hair_deform_edit.jump_curve",
+                            text="Jump to Curve", icon='CURVE_BEZCURVE')
             return
 
         col = layout.column(align=True)
@@ -175,6 +191,15 @@ class HAIRDEFORM_PT_panel(bpy.types.Panel):
         col = layout.column(align=True)
         col.label(text="Clean Up")
         col.operator("hair_deform_edit.smooth_card", icon='MOD_SMOOTH')
+        col.operator("hair_deform_edit.add_card_segments", icon='MOD_ARRAY')
+        row = col.row(align=True)
+        row.operator("hair_deform_edit.card_length", icon='ARROW_LEFTRIGHT')
+        row.prop(settings, "length_invert", text="Invert")
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.operator("hair_deform_edit.jump_curve", text="Jump to Curve",
+                     icon='CURVE_BEZCURVE')
 
         layout.separator()
         col = layout.column(align=True)

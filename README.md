@@ -47,6 +47,26 @@ the sidebar panel, smooths the card in the shape you see:
 On a bent test card with jagged edges, the sharpest corner went from 26 to 8
 degrees and the width error from 20% to 7%.
 
+### Card clean-up tools
+
+All in Vertex (Ctrl+V) and the Clean Up section of the sidebar panel. They work
+on the card as you see it, and the modifier keeps bending the result.
+
+- **Add Card Segments** - adds rows to the selected faces. New rows land exactly
+  on the bend, existing rows do not move, and UVs are cut along with the faces.
+  Round Corners also softens existing corners.
+- **Card Length** - makes whole cards longer or shorter along their own length.
+  The root stays, width and bend are kept, and past the old tip the card carries
+  on straight. Drag toward the tip to lengthen, away to shorten, or type a
+  number. The higher end of a card is its root; a card on a Curve modifier grows
+  from where its curve starts. The Invert checkbox next to the button grows from
+  the other end; `F` while dragging swaps it for one go.
+- **Jump to Curve** - `Shift+Alt+C` goes from the selected cards to the curves
+  that bend them, and from a curve back to its cards. Edit or Object Mode is
+  kept, and the card's vertex selection is still there when you come back. A
+  hidden curve is shown for the jump and hidden again on the way back. Also in
+  the Select menu.
+
 ## Install
 
 Edit > Preferences > Add-ons > Install from Disk, pick the zip, enable it.
@@ -63,6 +83,7 @@ While it is on:
 - `Alt+S` - shrink/fatten along the visible normal
 - `Shift+Alt+G` / `R` / `S` - same thing, always available even with the toggle off
 - `Shift+Alt+F` - shrink/fatten, always available
+- `Shift+Alt+C` - jump between a card and its curve
 - `X` / `Y` / `Z` - axis constraint, `Shift+X` etc for plane
 - `Ctrl` - toggle snapping mid-drag
 - Wheel / PageUp / PageDown - proportional falloff size

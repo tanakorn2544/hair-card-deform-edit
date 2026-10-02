@@ -21,7 +21,7 @@ bl_info = {
 
 import bpy
 
-from . import keymaps, ops, smooth, solver, ui
+from . import cardshape, jump, keymaps, ops, smooth, solver, ui
 
 _extra_keymaps = []
 
@@ -37,6 +37,11 @@ _EXTRA = (
     ('F', "hair_deform_edit.transform", 'SHRINK_FATTEN'),
     ('A', "hair_deform_edit.align_orientation", None),
 )
+
+
+# Jump Card / Curve sits in the Select menu of Object, Mesh and Curve modes.
+_JUMP_MENUS = ("VIEW3D_MT_select_object", "VIEW3D_MT_select_edit_mesh",
+               "VIEW3D_MT_select_edit_curve")
 
 
 def _register_extra_keymaps():
@@ -85,11 +90,19 @@ def register():
         bpy.utils.register_class(cls)
     for cls in smooth.CLASSES:
         bpy.utils.register_class(cls)
+    for cls in cardshape.CLASSES:
+        bpy.utils.register_class(cls)
+    for cls in jump.CLASSES:
+        bpy.utils.register_class(cls)
+    for menu in _JUMP_MENUS:
+        getattr(bpy.types, menu).append(jump.menu_func)
     bpy.types.VIEW3D_MT_edit_mesh_vertices.append(smooth.menu_func)
+    bpy.types.VIEW3D_MT_edit_mesh_vertices.append(cardshape.menu_func)
     bpy.types.Scene.hair_deform_edit = bpy.props.PointerProperty(
         type=ui.HairDeformSettings)
     ui.register_handlers()
     _register_extra_keymaps()
+    jump.register_keymaps()
     _apply_toggle()
     bpy.app.timers.register(_apply_toggle, first_interval=0.0)
 
@@ -97,11 +110,28 @@ def register():
 def unregister():
     keymaps.disable()
     _unregister_extra_keymaps()
+    jump.unregister_keymaps()
+    for menu in _JUMP_MENUS:
+        try:
+            getattr(bpy.types, menu).remove(jump.menu_func)
+        except Exception:
+            pass
+    for cls in reversed(jump.CLASSES):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
     ui.unregister_handlers()
-    try:
-        bpy.types.VIEW3D_MT_edit_mesh_vertices.remove(smooth.menu_func)
-    except Exception:
-        pass
+    for fn in (smooth.menu_func, cardshape.menu_func):
+        try:
+            bpy.types.VIEW3D_MT_edit_mesh_vertices.remove(fn)
+        except Exception:
+            pass
+    for cls in reversed(cardshape.CLASSES):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
     for cls in reversed(smooth.CLASSES):
         try:
             bpy.utils.unregister_class(cls)
